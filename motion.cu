@@ -7,6 +7,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+// ================= READ JPG =================
 unsigned char* read_jpg(const char *filename, int *width, int *height) {
     int channels;
     unsigned char *data = stbi_load(filename, width, height, &channels, 1);
@@ -19,9 +20,27 @@ unsigned char* read_jpg(const char *filename, int *width, int *height) {
     return data;
 }
 
+// ================= CUDA AVERAGING =================
+__global__ void average_kernel(unsigned char* images, unsigned char* avg,
+                               int num_images, int size) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < size) {
+        int sum = 0;
+
+        for (int k = 0; k < num_images; k++) {
+            sum += images[k * size + i];
+        }
+
+        avg[i] = sum / num_images;
+    }
+}
+
+// ================= GPU-BASED AVERAGE WINDOW =================
 unsigned char* average_window(int start, int window, int* width, int* height) {
 
-    unsigned int* sum = NULL;
+    unsigned char* h_images = NULL;
     int valid_count = 0;
     int fail_streak = 0;
 
@@ -41,20 +60,19 @@ unsigned char* average_window(int start, int window, int* width, int* height) {
                 break;
             }
 
-            continue; 
+            continue;
         }
 
-        fail_streak = 0; 
+        fail_streak = 0;
 
         if (valid_count == 0) {
             *width = w;
             *height = h;
-            sum = (unsigned int*)calloc(w * h, sizeof(unsigned int));
+            h_images = (unsigned char*)malloc(window * w * h);
         }
 
-        for (int j = 0; j < w * h; j++) {
-            sum[j] += img[j];
-        }
+        memcpy(h_images + valid_count * (*width) * (*height),
+               img, (*width) * (*height));
 
         valid_count++;
 
@@ -66,17 +84,34 @@ unsigned char* average_window(int start, int window, int* width, int* height) {
         return NULL;
     }
 
-    unsigned char* avg = (unsigned char*)malloc((*width) * (*height));
+    int size = (*width) * (*height);
 
-    for (int j = 0; j < (*width) * (*height); j++) {
-        avg[j] = sum[j] / valid_count;
-    }
+    unsigned char *d_images, *d_avg;
 
-    free(sum);
+    cudaMalloc(&d_images, valid_count * size);
+    cudaMalloc(&d_avg, size);
+
+    cudaMemcpy(d_images, h_images,
+               valid_count * size,
+               cudaMemcpyHostToDevice);
+
+    int threads = 256;
+    int blocks = (size + threads - 1) / threads;
+
+    average_kernel<<<blocks, threads>>>(d_images, d_avg, valid_count, size);
+
+    unsigned char* avg = (unsigned char*)malloc(size);
+
+    cudaMemcpy(avg, d_avg, size, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_images);
+    cudaFree(d_avg);
+    free(h_images);
+
     return avg;
 }
 
-
+// ================= SUBTRACTION =================
 __global__ void subtract(unsigned char *prev, unsigned char *curr, unsigned char *out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -86,7 +121,7 @@ __global__ void subtract(unsigned char *prev, unsigned char *curr, unsigned char
     }
 }
 
-//THRESHOLD 
+// ================= THRESHOLD =================
 __global__ void threshold(unsigned char *in, unsigned char *out, int n, int T) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -94,7 +129,7 @@ __global__ void threshold(unsigned char *in, unsigned char *out, int n, int T) {
     }
 }
 
-//MORPHOLOGY
+// ================= MORPHOLOGY =================
 __global__ void erosion(unsigned char *in, unsigned char *out, int width, int height) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -116,32 +151,33 @@ __global__ void erosion(unsigned char *in, unsigned char *out, int width, int he
     out[y * width + x] = min;
 }
 
+// ================= MAIN =================
 int main() {
-    int num=0;
-    float avg=0;
+
+    int num = 0;
+    float avg = 0;
     int width, height;
+
     const int window = 7;
     const int lower_bound = 2;
     int upper_bound = 140;
 
-    // CUDA timing
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    
-    for (int i = lower_bound; i <= upper_bound; i +=window) {
+    for (int i = lower_bound; i <= upper_bound; i += window) {
 
-        char prev_name[100], curr_name[100], out_name[100];
-
-        sprintf(prev_name, "dataset/input/in%06d.jpg", i - 1);
-        sprintf(curr_name, "dataset/input/in%06d.jpg", i);
+        char out_name[100];
         sprintf(out_name, "dataset/output/out%06d.jpg", i);
-
-        
 
         unsigned char *h_prev = average_window(i - 1, window, &width, &height);
         unsigned char *h_curr = average_window(i, window, &width, &height);
+
+        if (h_prev == NULL || h_curr == NULL) {
+            printf("Skipping frame %d due to insufficient data\n", i);
+            continue;
+        }
 
         int size = width * height;
 
@@ -165,7 +201,7 @@ int main() {
         cudaEventRecord(start);
 
         subtract<<<blocks, threads>>>(d_prev, d_curr, d_diff, size);
-        threshold<<<blocks, threads>>>(d_diff, d_thresh, size, 10);
+        threshold<<<blocks, threads>>>(d_diff, d_thresh, size, 5);
         erosion<<<b2, t2>>>(d_thresh, d_morph, width, height);
 
         cudaEventRecord(stop);
@@ -178,16 +214,10 @@ int main() {
         cudaMemcpy(h_diff, d_diff, size, cudaMemcpyDeviceToHost);
 
         stbi_write_jpg(out_name, width, height, 1, h_diff, 100);
-        
-        if (h_prev == NULL || h_curr == NULL) {
-    printf("Skipping frame %d due to insufficient data\n", i);
-    continue;
-}
 
         printf("Processed window starting at frame %d | Time: %.3f ms | Saved: %s\n",
                i, ms, out_name);
 
-        // MOTION DETECTION (SEPARATE) 
         unsigned char *h_thresh = (unsigned char*)malloc(size);
         cudaMemcpy(h_thresh, d_thresh, size, cudaMemcpyDeviceToHost);
 
@@ -199,13 +229,12 @@ int main() {
 
         float percent = (motion_pixels * 100.0f) / size;
         num++;
-        
+
         if (percent > 0.1f) {
             avg += percent;
             printf("Motion detected (%.3f%% pixels)\n", percent);
         }
 
-        // -------- CLEANUP --------
         stbi_image_free(h_prev);
         stbi_image_free(h_curr);
 
@@ -218,6 +247,8 @@ int main() {
         cudaFree(d_thresh);
         cudaFree(d_morph);
     }
-    printf("Average motion percentage till the last frame considered: %.3f%%\n pixels", avg / num);
+
+    printf("Average motion percentage till the last frame considered: %.3f%% pixels\n", avg / num);
+
     return 0;
 }

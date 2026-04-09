@@ -7,7 +7,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
-// ================= READ JPG =================
+//read image
 unsigned char* read_jpg(const char *filename, int *width, int *height) {
     int channels;
     unsigned char *data = stbi_load(filename, width, height, &channels, 1);
@@ -20,7 +20,7 @@ unsigned char* read_jpg(const char *filename, int *width, int *height) {
     return data;
 }
 
-// ================= CUDA KERNEL FOR AVERAGING =================
+//  CUDA KERNEL FOR AVERAGING
 __global__ void average_kernel(unsigned int* sum, unsigned char* avg, int count, int size) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -29,7 +29,7 @@ __global__ void average_kernel(unsigned int* sum, unsigned char* avg, int count,
     }
 }
 
-// ================= AVERAGE WINDOW =================
+//  AVERAGE WINDOW CPU (calls cuda kernel)
 unsigned char* average_window(int start, int window, int* width, int* height) {
 
     unsigned int* sum = NULL;
@@ -79,7 +79,7 @@ unsigned char* average_window(int start, int window, int* width, int* height) {
 
     int size = (*width) * (*height);
 
-    // -------- GPU PART (ONLY CHANGE) --------
+    // Kernel call
     unsigned int *d_sum;
     unsigned char *d_avg;
 
@@ -104,7 +104,7 @@ unsigned char* average_window(int start, int window, int* width, int* height) {
     return avg;
 }
 
-// ================= SUBTRACTION =================
+// ================= SUBTRACTION 
 __global__ void subtract(unsigned char *prev, unsigned char *curr, unsigned char *out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -144,7 +144,7 @@ __global__ void erosion(unsigned char *in, unsigned char *out, int width, int he
     out[y * width + x] = min;
 }
 
-// ================= MAIN =================
+
 int main() {
     int num=0;
     float avg=0;
